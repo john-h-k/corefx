@@ -191,54 +191,159 @@ namespace System
         /// <summary>
         /// Fills the contents of this span with the given value.
         /// </summary>
-        public void Fill(T value)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe void Fill(T value)
         {
-            if (Unsafe.SizeOf<T>() == 1)
-            {
-                uint length = (uint)_length;
-                if (length == 0)
-                    return;
+            if (IsEmpty) return;
 
-                T tmp = value; // Avoid taking address of the "value" argument. It would regress performance of the loop below.
-                Unsafe.InitBlockUnaligned(ref Unsafe.As<T, byte>(ref _pointer.Value), Unsafe.As<T, byte>(ref tmp), length);
+            int size = Unsafe.SizeOf<T>();
+            int len = Length;
+
+            Debug.Assert(size > 0 && len > 0);
+
+
+            // This branch is either selected or elided by the JIT at JIT time
+            if (!RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                int fullSize = len * size;
+
+                // If the size is 1, which is a JIT time constant, the method just becomes initblk
+                if (size == 1)
+                {
+                    Unsafe.InitBlockUnaligned(ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this)), Unsafe.As<T, byte>(ref value),
+                        (uint)len);
+                    return;
+                }
+
+                // This and the SSE pathway cannot be fully elided by the JIT because they are dependent on the size of the data being filled,
+                // but they will be elided if they are not supported or the size is not supported
+                if (Avx.IsSupported
+                    && fullSize >= 32 && (size & (size - 1)) == 0 && size <= 32)
+                {
+                    // Is pow of 2
+
+                    Vector256<byte> vector;
+                    switch (Unsafe.SizeOf<T>())
+                    {
+                        case 1:
+                            vector = Vector256.Create(Unsafe.As<T, byte>(ref value));
+                            break;
+                        case 2:
+                            vector = Vector256.Create(Unsafe.As<T, ushort>(ref value)).AsByte();
+                            break;
+                        case 4:
+                            vector = Vector256.Create(Unsafe.As<T, uint>(ref value)).AsByte();
+                            break;
+                        case 8:
+                            vector = Vector256.Create(Unsafe.As<T, ulong>(ref value)).AsByte();
+                            break;
+                        case 16:
+                            Vector128<byte> tmp = Unsafe.As<T, Vector128<byte>>(ref value);
+                            vector = Avx2.BroadcastScalarToVector256(tmp);
+                            break;
+                        case 32:
+                            vector = Unsafe.As<T, Vector256<byte>>(ref value);
+                            break;
+                        default:
+                            return; // unreachable, necessary
+                    }
+
+                    ref byte start = ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this));
+                    fixed (byte* p = &start)
+                    {
+                        byte* pAliasedVector = p; // to be mutable
+
+                        Avx.Store(pAliasedVector, vector);
+
+                        if (fullSize == 32)
+                            return; // previous store was all needed
+
+                        pAliasedVector = (byte*)RoundUp(pAliasedVector, 32); // round up pointer to next 32 byte to allow aligned stores
+                        Debug.Assert((ulong)pAliasedVector % 32 == 0);
+
+                        fullSize -= (int)(pAliasedVector - p);
+
+                        for (var i = 0; i < (fullSize & ~31U); i += 32)
+                        {
+                            Avx.StoreAligned(pAliasedVector + i, vector); // we explicitly use aligned here, even though it has the same behaviour as unaligned store, to ensure it is properly aligned
+                        }
+
+                        if (fullSize % 32 == 0)
+                            return;
+
+                        Avx.Store((pAliasedVector + fullSize) - 32, vector);
+                    }
+                }
+                else if (Sse2.IsSupported && fullSize >= 16 && (size & (size - 1)) == 0 && size <= 16)
+                {
+                    // Is pow of 2
+
+                    Vector128<byte> vector;
+                    switch (Unsafe.SizeOf<T>())
+                    {
+                        case 1:
+                            vector = Vector128.Create(Unsafe.As<T, byte>(ref value));
+                            break;
+                        case 2:
+                            vector = Vector128.Create(Unsafe.As<T, ushort>(ref value)).AsByte();
+                            break;
+                        case 4:
+                            vector = Vector128.Create(Unsafe.As<T, uint>(ref value)).AsByte();
+                            break;
+                        case 8:
+                            vector = Vector128.Create(Unsafe.As<T, ulong>(ref value)).AsByte();
+                            break;
+                        case 16:
+                            vector = Unsafe.As<T, Vector128<byte>>(ref value);
+                            break;
+                        default:
+                            return; // unreachable, necessary
+                    }
+
+                    ref byte start = ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this));
+                    fixed (byte* p = &start)
+                    {
+                        byte* pAliasedVector = p; // to allow difference to be taken
+
+                        Sse2.Store(pAliasedVector, vector);
+                        if (fullSize == 16)
+                            return; // previous store was all needed
+
+                        pAliasedVector = (byte*)RoundUp(pAliasedVector, 16); // round up pointer to next 16 byte to allow aligned stores
+                        Debug.Assert((ulong)pAliasedVector % 16 == 0);
+
+                        fullSize -= (int)(pAliasedVector - p);
+
+                        for (var i = 0; i < (fullSize & ~15U); i += 16)
+                        {
+                            Sse2.StoreAligned(pAliasedVector + i, vector);
+                        }
+
+                        if (fullSize % 16 == 0)
+                            return;
+
+                        Sse2.Store((pAliasedVector + fullSize) - 16, vector);
+                    }
+                }
+                else
+                {
+                    SoftwareFallback(this, value);
+                }
             }
             else
             {
-                // Do all math as nuint to avoid unnecessary 64->32->64 bit integer truncations
-                nuint length = (uint)_length;
-                if (length == 0)
-                    return;
+                SoftwareFallback(this, value);
+            }
 
-                ref T r = ref _pointer.Value;
-
-                // TODO: Create block fill for value types of power of two sizes e.g. 2,4,8,16
-
-                nuint elementSize = (uint)Unsafe.SizeOf<T>();
-                nuint i = 0;
-                for (; i < (length & ~(nuint)7); i += 8)
+            static void SoftwareFallback(Span<T> span, T value)
+            {
+                for (var i = 0; i < span.Length; i++)
                 {
-                    Unsafe.AddByteOffset<T>(ref r, (i + 0) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 1) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 2) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 3) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 4) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 5) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 6) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 7) * elementSize) = value;
-                }
-                if (i < (length & ~(nuint)3))
-                {
-                    Unsafe.AddByteOffset<T>(ref r, (i + 0) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 1) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 2) * elementSize) = value;
-                    Unsafe.AddByteOffset<T>(ref r, (i + 3) * elementSize) = value;
-                    i += 4;
-                }
-                for (; i < length; i++)
-                {
-                    Unsafe.AddByteOffset<T>(ref r, i * elementSize) = value;
+                    span[i] = value;
                 }
             }
+
+            static void* RoundUp(void* p, uint alignment) => (void*)(((ulong)p + (alignment - 1UL)) & ~(alignment - 1UL));
         }
 
         /// <summary>

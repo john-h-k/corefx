@@ -239,7 +239,7 @@ namespace System
                             break;
                         case 16:
                             Vector128<byte> tmp = Unsafe.As<T, Vector128<byte>>(ref value);
-                            vector = Avx2.BroadcastScalarToVector256(tmp);
+                            vector = Vector256.Create(tmp, tmp);
                             break;
                         case 32:
                             vector = Unsafe.As<T, Vector256<byte>>(ref value);

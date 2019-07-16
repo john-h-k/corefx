@@ -197,7 +197,7 @@ namespace System
             if (IsEmpty) return;
 
             int size = Unsafe.SizeOf<T>();
-            int len = Length;
+            int len = _length;
 
             Debug.Assert(size > 0 && len > 0);
 
@@ -210,7 +210,7 @@ namespace System
                 // If the size is 1, which is a JIT time constant, the method just becomes initblk
                 if (size == 1)
                 {
-                    Unsafe.InitBlockUnaligned(ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this)), Unsafe.As<T, byte>(ref value),
+                    Unsafe.InitBlockUnaligned(ref Unsafe.As<T, byte>(ref _pointer.Value), Unsafe.As<T, byte>(ref value),
                         (uint)len);
                     return;
                 }
@@ -248,7 +248,7 @@ namespace System
                             return; // unreachable, necessary
                     }
 
-                    ref byte start = ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this));
+                    ref byte start = ref Unsafe.As<T, byte>(ref _pointer.Value);
                     fixed (byte* p = &start)
                     {
                         byte* pAliasedVector = p; // to be mutable
@@ -261,7 +261,14 @@ namespace System
                         pAliasedVector = (byte*)RoundUp(pAliasedVector, 32); // round up pointer to next 32 byte to allow aligned stores
                         Debug.Assert((ulong)pAliasedVector % 32 == 0);
 
-                        fullSize -= (int)(pAliasedVector - p);
+                        byte* pool = stackalloc byte[32 * 2];
+                        Unsafe.Write(pool, vector);
+                        Unsafe.Write(pool + 32, vector);
+
+                        var diff = (int)(pAliasedVector - p);
+                        fullSize -= diff;
+                        Vector256<byte> cpy = vector;
+                        vector = Unsafe.ReadUnaligned<Vector256<byte>>(pool + diff);
 
                         for (var i = 0; i < (fullSize & ~31U); i += 32)
                         {
@@ -271,7 +278,7 @@ namespace System
                         if (fullSize % 32 == 0)
                             return;
 
-                        Avx.Store((pAliasedVector + fullSize) - 32, vector);
+                        Avx.Store((pAliasedVector + fullSize) - 32, cpy);
                     }
                 }
                 else if (Sse2.IsSupported && fullSize >= 16 && (size & (size - 1)) == 0 && size <= 16)
@@ -300,7 +307,7 @@ namespace System
                             return; // unreachable, necessary
                     }
 
-                    ref byte start = ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this));
+                    ref byte start = ref Unsafe.As<T, byte>(ref _pointer.Value);
                     fixed (byte* p = &start)
                     {
                         byte* pAliasedVector = p; // to allow difference to be taken
@@ -312,7 +319,14 @@ namespace System
                         pAliasedVector = (byte*)RoundUp(pAliasedVector, 16); // round up pointer to next 16 byte to allow aligned stores
                         Debug.Assert((ulong)pAliasedVector % 16 == 0);
 
-                        fullSize -= (int)(pAliasedVector - p);
+                        byte* pool = stackalloc byte[16 * 2];
+                        Unsafe.Write(pool, vector);
+                        Unsafe.Write(pool + 16, vector);
+
+                        var diff = (int)(pAliasedVector - p);
+                        fullSize -= diff;
+                        Vector128<byte> cpy = vector;
+                        vector = Unsafe.ReadUnaligned<Vector128<byte>>(pool + diff);
 
                         for (var i = 0; i < (fullSize & ~15U); i += 16)
                         {
@@ -322,7 +336,7 @@ namespace System
                         if (fullSize % 16 == 0)
                             return;
 
-                        Sse2.Store((pAliasedVector + fullSize) - 16, vector);
+                        Sse2.Store((pAliasedVector + fullSize) - 16, cpy);
                     }
                 }
                 else

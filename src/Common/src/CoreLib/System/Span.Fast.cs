@@ -272,7 +272,7 @@ namespace System
 
                         for (var i = 0; i < (fullSize & ~31U); i += 32)
                         {
-                            Avx.StoreAligned(pAliasedVector + i, vector); // we explicitly use aligned here, even though it has the same behaviour as unaligned store, to ensure it is properly aligned
+                            Avx.Store(pAliasedVector + i, vector); 
                         }
 
                         if (fullSize % 32 == 0)
@@ -330,7 +330,7 @@ namespace System
 
                         for (var i = 0; i < (fullSize & ~15U); i += 16)
                         {
-                            Sse2.StoreAligned(pAliasedVector + i, vector);
+                            Sse2.Store(pAliasedVector + i, vector);
                         }
 
                         if (fullSize % 16 == 0)

@@ -270,7 +270,7 @@ namespace System
                         return; // previous store was all needed
                     }
 
-                    pAliasedVector = (byte*)RoundUp(pAliasedVector, 32); // round up pointer to next 32 byte to allow aligned stores
+                    pAliasedVector = (byte*)RoundUp(pAliasedVector, 32); // round up pointer to next 32 bytes to allow aligned stores
                     Debug.Assert((ulong)pAliasedVector % 32 == 0);
 
                     // This block rotates the vector to accomodate for the fact it has been offset by rounding up the pointer for alignment
@@ -302,6 +302,9 @@ namespace System
             {
 
                 Vector128<byte> vector;
+
+                // Create the vector by filling it with {n} Ts, where {n} is 16 / sizeof(T)
+                // This table is elided to a single branch at JIT time
                 switch (size)
                 {
                     case 1:
@@ -323,40 +326,44 @@ namespace System
                         return; // unreachable, necessary
                 }
 
+                // We verified the span was not empty at the start, so the check from GetPinnableReference is not necessary
+                // As this T is not constrained to be 'unmanaged' (even though we have confirmed it is), we must cast to a 'ref byte' first
                 fixed (byte* p = &Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this)))
                 {
-                    byte* pAliasedVector = p; // to allow difference to be taken
+                    byte* pAliasedVector = p; // a copy is required to find the alignment difference
 
-                    Sse2.Store(pAliasedVector, vector);
+                    Sse2.Store(pAliasedVector, vector); // initial, unaligned store
 
                     if (fullSize == 16)
                     {
                         return; // previous store was all needed
                     }
 
-                    pAliasedVector = (byte*)RoundUp(pAliasedVector, 16); // round up pointer to next 16 byte to allow aligned stores
+                    pAliasedVector = (byte*)RoundUp(pAliasedVector, 16); // round up pointer to next 16 bytes to allow aligned stores
                     Debug.Assert((ulong)pAliasedVector % 16 == 0);
 
+                    // This block rotates the vector to accomodate for the fact it has been offset by rounding up the pointer for alignment
                     byte* pool = stackalloc byte[16 * 2];
                     Sse2.Store(pool, vector);
                     Sse2.Store(pool + 16, vector);
 
                     var diff = (int)(pAliasedVector - p);
                     fullSize -= diff;
-                    Vector128<byte> cpy = vector;
+                    Vector128<byte> cpy = vector; // we make a copy here that we use for the final, unaligned store
                     vector = Sse2.LoadVector128(pool + diff);
 
                     for (var i = 0; i < (fullSize & ~15U); i += 16)
                     {
-                        Sse2.Store(pAliasedVector + i, vector);
+                        Sse2.Store(pAliasedVector + i, vector); // These stores are aligned (the assertion above confirms that), but we use the non aligned 
+                                                                // instruction anyway for VEX encoding
                     }
 
                     if (fullSize % 16 == 0)
                     {
-                        return;
+                        return; // no need for final unaligned store
                     }
 
-                    Sse2.Store((pAliasedVector + fullSize) - 16, cpy);
+                    Sse2.Store((pAliasedVector + fullSize) - 16, cpy); // A final unaligned store, for up to the last 31 bytes, using the original vector
                 }
             }
             else

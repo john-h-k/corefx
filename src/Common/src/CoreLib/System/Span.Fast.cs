@@ -194,8 +194,12 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public unsafe void Fill(T value)
         {
-            if (IsEmpty) return;
+            if (IsEmpty)
+            {
+                return;
+            }
 
+            // The branches based on this are stil properly folded, it is just more concise than writing 'Unsafe.SizeOf<T>()' everytime
             int size = Unsafe.SizeOf<T>();
             int len = _length;
 
@@ -203,151 +207,163 @@ namespace System
 
 
             // This branch is either selected or elided by the JIT at JIT time
-            if (!RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             {
-                int fullSize = len * size;
+                SoftwareFallback(this, value);
+                return;
+            }
 
-                // If the size is 1, which is a JIT time constant, the method just becomes initblk
-                if (size == 1)
+            int fullSize = len * size;
+
+            // If the size is 1, which is a JIT time constant, the method just becomes initblk, which appears to perform better than the manual AVX or SSE pathways
+            if (size == 1)
+            {
+                Unsafe.InitBlockUnaligned(ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this)), Unsafe.As<T, byte>(ref value),
+                    (uint)len); // won't overflow, unless someone has reflected into the '_length' field and changed it to a negative value. Not particularly concerned with that scenario
+                return;
+            }
+
+            // This and the SSE pathway cannot be fully elided by the JIT because they are dependent on the size of the data being filled,
+            // but they will be elided if they are not supported or the size is not supported
+            if (Avx.IsSupported
+                && (fullSize >= 32) && ((size & (size - 1)) == 0 /* Is pow of 2 */) && (size <= 32))
+            {
+                Vector256<byte> vector;
+
+                // Create the vector by filling it with {n} Ts, where {n} is 32 / sizeof(T)
+                // This table is elided to a single branch at JIT time
+                switch (size)
                 {
-                    Unsafe.InitBlockUnaligned(ref Unsafe.As<T, byte>(ref _pointer.Value), Unsafe.As<T, byte>(ref value),
-                        (uint)len);
-                    return;
+                    case 1:
+                        vector = Vector256.Create(Unsafe.As<T, byte>(ref value));
+                        break;
+                    case 2:
+                        vector = Vector256.Create(Unsafe.As<T, ushort>(ref value)).AsByte();
+                        break;
+                    case 4:
+                        vector = Vector256.Create(Unsafe.As<T, uint>(ref value)).AsByte();
+                        break;
+                    case 8:
+                        vector = Vector256.Create(Unsafe.As<T, ulong>(ref value)).AsByte();
+                        break;
+                    case 16:
+                        Vector128<byte> tmp = Unsafe.As<T, Vector128<byte>>(ref value);
+                        vector = Vector256.Create(tmp, tmp);
+                        break;
+                    case 32:
+                        vector = Unsafe.As<T, Vector256<byte>>(ref value);
+                        break;
+                    default:
+                        return; // unreachable, necessary
                 }
 
-                // This and the SSE pathway cannot be fully elided by the JIT because they are dependent on the size of the data being filled,
-                // but they will be elided if they are not supported or the size is not supported
-                if (Avx.IsSupported
-                    && fullSize >= 32 && (size & (size - 1)) == 0 && size <= 32)
+                // We verified the span was not empty at the start, so the check from GetPinnableReference is not necessary
+                // As this T is not constrained to be 'unmanaged' (even though we have confirmed it is), we must cast to a 'ref byte' first
+                fixed (byte* p = &Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this)))
                 {
-                    // Is pow of 2
+                    byte* pAliasedVector = p; // a copy is required to find the alignment difference
 
-                    Vector256<byte> vector;
-                    switch (Unsafe.SizeOf<T>())
+                    Avx.Store(pAliasedVector, vector); // initial, unaligned store
+
+                    if (fullSize == 32)
                     {
-                        case 1:
-                            vector = Vector256.Create(Unsafe.As<T, byte>(ref value));
-                            break;
-                        case 2:
-                            vector = Vector256.Create(Unsafe.As<T, ushort>(ref value)).AsByte();
-                            break;
-                        case 4:
-                            vector = Vector256.Create(Unsafe.As<T, uint>(ref value)).AsByte();
-                            break;
-                        case 8:
-                            vector = Vector256.Create(Unsafe.As<T, ulong>(ref value)).AsByte();
-                            break;
-                        case 16:
-                            Vector128<byte> tmp = Unsafe.As<T, Vector128<byte>>(ref value);
-                            vector = Vector256.Create(tmp, tmp);
-                            break;
-                        case 32:
-                            vector = Unsafe.As<T, Vector256<byte>>(ref value);
-                            break;
-                        default:
-                            return; // unreachable, necessary
+                        return; // previous store was all needed
                     }
 
-                    ref byte start = ref Unsafe.As<T, byte>(ref _pointer.Value);
-                    fixed (byte* p = &start)
+                    pAliasedVector = (byte*)RoundUp(pAliasedVector, 32); // round up pointer to next 32 byte to allow aligned stores
+                    Debug.Assert((ulong)pAliasedVector % 32 == 0);
+
+                    // This block rotates the vector to accomodate for the fact it has been offset by rounding up the pointer for alignment
+                    byte* pool = stackalloc byte[32 * 2];
+                    Avx.Store(pool, vector);
+                    Avx.Store(pool + 32, vector);
+
+                    var diff = (int)(pAliasedVector - p);
+                    fullSize -= diff;
+                    Vector256<byte> cpy = vector; // we make a copy here that we use for the final, unaligned store
+                    vector = Avx.LoadVector256(pool + diff);
+
+                    for (var i = 0; i < (fullSize & ~31U); i += 32)
                     {
-                        byte* pAliasedVector = p; // to be mutable
-
-                        Avx.Store(pAliasedVector, vector);
-
-                        if (fullSize == 32)
-                            return; // previous store was all needed
-
-                        pAliasedVector = (byte*)RoundUp(pAliasedVector, 32); // round up pointer to next 32 byte to allow aligned stores
-                        Debug.Assert((ulong)pAliasedVector % 32 == 0);
-
-                        byte* pool = stackalloc byte[32 * 2];
-                        Unsafe.Write(pool, vector);
-                        Unsafe.Write(pool + 32, vector);
-
-                        var diff = (int)(pAliasedVector - p);
-                        fullSize -= diff;
-                        Vector256<byte> cpy = vector;
-                        vector = Unsafe.ReadUnaligned<Vector256<byte>>(pool + diff);
-
-                        for (var i = 0; i < (fullSize & ~31U); i += 32)
-                        {
-                            Avx.Store(pAliasedVector + i, vector); 
-                        }
-
-                        if (fullSize % 32 == 0)
-                            return;
-
-                        Avx.Store((pAliasedVector + fullSize) - 32, cpy);
+                        Avx.Store(pAliasedVector + i, vector); // These stores are aligned (the assertion above confirms that), but we use the non aligned 
+                                                               // instruction anyway for VEX encoding
                     }
+
+                    if (fullSize % 32 == 0)
+                    {
+                        return; // no need for final unaligned store
+                    }
+
+                    Avx.Store((pAliasedVector + fullSize) - 32, cpy); // A final unaligned store, for up to the last 31 bytes, using the original vector
                 }
-                else if (Sse2.IsSupported && fullSize >= 16 && (size & (size - 1)) == 0 && size <= 16)
+            }
+            else if (Sse2.IsSupported
+            && (fullSize >= 16) && ((size & (size - 1)) == 0 /* Is pow of 2 */) && (size <= 16))
+            {
+
+                Vector128<byte> vector;
+                switch (size)
                 {
-                    // Is pow of 2
-
-                    Vector128<byte> vector;
-                    switch (Unsafe.SizeOf<T>())
-                    {
-                        case 1:
-                            vector = Vector128.Create(Unsafe.As<T, byte>(ref value));
-                            break;
-                        case 2:
-                            vector = Vector128.Create(Unsafe.As<T, ushort>(ref value)).AsByte();
-                            break;
-                        case 4:
-                            vector = Vector128.Create(Unsafe.As<T, uint>(ref value)).AsByte();
-                            break;
-                        case 8:
-                            vector = Vector128.Create(Unsafe.As<T, ulong>(ref value)).AsByte();
-                            break;
-                        case 16:
-                            vector = Unsafe.As<T, Vector128<byte>>(ref value);
-                            break;
-                        default:
-                            return; // unreachable, necessary
-                    }
-
-                    ref byte start = ref Unsafe.As<T, byte>(ref _pointer.Value);
-                    fixed (byte* p = &start)
-                    {
-                        byte* pAliasedVector = p; // to allow difference to be taken
-
-                        Sse2.Store(pAliasedVector, vector);
-                        if (fullSize == 16)
-                            return; // previous store was all needed
-
-                        pAliasedVector = (byte*)RoundUp(pAliasedVector, 16); // round up pointer to next 16 byte to allow aligned stores
-                        Debug.Assert((ulong)pAliasedVector % 16 == 0);
-
-                        byte* pool = stackalloc byte[16 * 2];
-                        Unsafe.Write(pool, vector);
-                        Unsafe.Write(pool + 16, vector);
-
-                        var diff = (int)(pAliasedVector - p);
-                        fullSize -= diff;
-                        Vector128<byte> cpy = vector;
-                        vector = Unsafe.ReadUnaligned<Vector128<byte>>(pool + diff);
-
-                        for (var i = 0; i < (fullSize & ~15U); i += 16)
-                        {
-                            Sse2.Store(pAliasedVector + i, vector);
-                        }
-
-                        if (fullSize % 16 == 0)
-                            return;
-
-                        Sse2.Store((pAliasedVector + fullSize) - 16, cpy);
-                    }
+                    case 1:
+                        vector = Vector128.Create(Unsafe.As<T, byte>(ref value));
+                        break;
+                    case 2:
+                        vector = Vector128.Create(Unsafe.As<T, ushort>(ref value)).AsByte();
+                        break;
+                    case 4:
+                        vector = Vector128.Create(Unsafe.As<T, uint>(ref value)).AsByte();
+                        break;
+                    case 8:
+                        vector = Vector128.Create(Unsafe.As<T, ulong>(ref value)).AsByte();
+                        break;
+                    case 16:
+                        vector = Unsafe.As<T, Vector128<byte>>(ref value);
+                        break;
+                    default:
+                        return; // unreachable, necessary
                 }
-                else
+
+                fixed (byte* p = &Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(this)))
                 {
-                    SoftwareFallback(this, value);
+                    byte* pAliasedVector = p; // to allow difference to be taken
+
+                    Sse2.Store(pAliasedVector, vector);
+
+                    if (fullSize == 16)
+                    {
+                        return; // previous store was all needed
+                    }
+
+                    pAliasedVector = (byte*)RoundUp(pAliasedVector, 16); // round up pointer to next 16 byte to allow aligned stores
+                    Debug.Assert((ulong)pAliasedVector % 16 == 0);
+
+                    byte* pool = stackalloc byte[16 * 2];
+                    Sse2.Store(pool, vector);
+                    Sse2.Store(pool + 16, vector);
+
+                    var diff = (int)(pAliasedVector - p);
+                    fullSize -= diff;
+                    Vector128<byte> cpy = vector;
+                    vector = Sse2.LoadVector128(pool + diff);
+
+                    for (var i = 0; i < (fullSize & ~15U); i += 16)
+                    {
+                        Sse2.Store(pAliasedVector + i, vector);
+                    }
+
+                    if (fullSize % 16 == 0)
+                    {
+                        return;
+                    }
+
+                    Sse2.Store((pAliasedVector + fullSize) - 16, cpy);
                 }
             }
             else
             {
                 SoftwareFallback(this, value);
             }
+
 
             static void SoftwareFallback(Span<T> span, T value)
             {
